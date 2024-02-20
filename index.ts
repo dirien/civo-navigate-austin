@@ -1,9 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
-import * as awsx from "@pulumi/awsx";
 import * as eks from "@pulumi/eks";
 import * as aws from "@pulumi/aws";
 import * as k8s from "@pulumi/kubernetes";
-import * as pinecone from "@pinecone-database/pulumi";
 
 // Grab some values from the Pulumi configuration (or use default values)
 const config = new pulumi.Config();
@@ -13,28 +11,68 @@ const desiredClusterSize = config.getNumber("desiredClusterSize") || 3;
 const eksNodeInstanceType = config.get("eksNodeInstanceType") || "t3.medium";
 const vpcNetworkCidr = config.get("vpcNetworkCidr") || "10.0.0.0/16";
 
+const publicSubnetCIDRs: pulumi.Input<string>[] = config.requireObject("publicSubnetCIDRs") || [
+    "10.0.0.0/27",
+    "10.0.0.32/27"
+];
+
+
+const availabilityZones: pulumi.Input<string>[] = config.requireObject("availabilityZones") || [
+    "eu-central-1a",
+    "eu-central-1b",
+];
+
 // Create a new VPC
-const eksVpc = new awsx.ec2.Vpc("eks-vpc", {
+const eksVpc = new aws.ec2.Vpc("eks-vpc", {
     enableDnsHostnames: true,
     cidrBlock: vpcNetworkCidr,
 });
 
+// Create an Internet Gateway and Route Table for the public subnets
+const eksInternetGateway = new aws.ec2.InternetGateway("eks-igw", {
+    vpcId: eksVpc.id,
+});
+
+const eksRouteTable = new aws.ec2.RouteTable("eks-rt", {
+    vpcId: eksVpc.id,
+    routes: [{
+        cidrBlock: "0.0.0.0/0",
+        gatewayId: eksInternetGateway.id,
+    }],
+});
+
+let publicSubnetIDs: pulumi.Input<string>[] = [];
+
+// Create the public subnets and route table associations
+for (let i = 0; i < availabilityZones.length; i++) {
+    const publicSubnet = new aws.ec2.Subnet(`eks-public-subnet-${i}`, {
+        vpcId: eksVpc.id,
+        mapPublicIpOnLaunch: false,
+        assignIpv6AddressOnCreation: false,
+        cidrBlock: publicSubnetCIDRs[i],
+        availabilityZone: availabilityZones[i],
+        tags: {
+            Name: `eks-public-subnet-${i}`,
+        }
+    });
+
+    publicSubnetIDs.push(publicSubnet.id);
+
+    new aws.ec2.RouteTableAssociation(`eks-rt-association-${i}`, {
+        subnetId: publicSubnet.id,
+        routeTableId: eksRouteTable.id,
+    });
+}
+
+
 // Create the EKS cluster
 const cluster = new eks.Cluster("eks-cluster", {
-    // Put the cluster in the new VPC created earlier
-    vpcId: eksVpc.vpcId,
-    // Public subnets will be used for load balancers
-    publicSubnetIds: eksVpc.publicSubnetIds,
-    // Private subnets will be used for cluster nodes
-    privateSubnetIds: eksVpc.privateSubnetIds,
-    // Change configuration values to change any of the following settings
+    vpcId: eksVpc.id,
+    privateSubnetIds: publicSubnetIDs,
     instanceType: eksNodeInstanceType,
     desiredCapacity: desiredClusterSize,
     minSize: minClusterSize,
     maxSize: maxClusterSize,
-    // Do not give the worker nodes public IP addresses
-    nodeAssociatePublicIpAddress: false,
-    // Change these values for a private cluster (VPN access required)
     endpointPrivateAccess: false,
     endpointPublicAccess: true,
     createOidcProvider: true,
@@ -42,8 +80,13 @@ const cluster = new eks.Cluster("eks-cluster", {
 });
 
 // Export some values for use elsewhere
-export const kubeconfig = cluster.kubeconfig;
-export const vpcId = eksVpc.vpcId;
+export const kubeconfig = pulumi.secret(cluster.kubeconfig);
+
+const provider = new k8s.Provider("k8s", {
+    kubeconfig: cluster.kubeconfigJson,
+    enableServerSideApply: true,
+});
+
 
 // @ts-ignore
 const assumeEBSRolePolicy = pulumi.all([cluster.core.oidcProvider.arn, cluster.core.oidcProvider.url])
@@ -85,10 +128,6 @@ const ebsRolePolicy = new aws.iam.RolePolicyAttachment("eks-ebs-role-policy", {
     policyArn: "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy",
 });
 
-const provider = new k8s.Provider("k8s", {
-    kubeconfig: cluster.kubeconfigJson,
-    enableServerSideApply: true,
-});
 
 new k8s.helm.v3.Release("aws-ebs-csi-driver", {
     chart: "aws-ebs-csi-driver",
@@ -113,22 +152,22 @@ new k8s.helm.v3.Release("aws-ebs-csi-driver", {
 
 new k8s.helm.v3.Release("local-ai", {
     chart: "local-ai",
-    version: "3.1.0",
+    version: "3.2.0",
     repositoryOpts: {
         repo: "https://go-skynet.github.io/helm-charts",
     },
+    forceUpdate: true,
     namespace: "local-ai",
     createNamespace: true,
     values: {
         deployment: {
-            image: "quay.io/go-skynet/local-ai:latest",
+            image: {
+                repository: "quay.io/go-skynet/local-ai",
+                tag: "latest",
+            },
             env: {
-                localai_mmap: "true",
-                threads: 4,
-                f16: "true",
                 debug: "true",
                 context_size: 512,
-                galleries: '[{"name":"model-gallery", "url":"github:go-skynet/model-gallery/index.yaml"}, {"url": "github:go-skynet/model-gallery/huggingface.yaml","name":"huggingface"}]',
                 modelsPath: "/models"
             }
         }, resources: {
@@ -140,20 +179,22 @@ new k8s.helm.v3.Release("local-ai", {
         models: {
             list: [
                 {
-                    url: "https://gpt4all.io/models/ggml-gpt4all-j.bin"
+                    url: "https://gpt4all.io/models/ggml-gpt4all-j.bin",
+                    name: "ggml-gpt4all-j"
                 }
             ],
-            persistence: {
-                pvc: {
-                    enabled: true,
-                    size: "100Gi",
-                    accessModes: [
-                        "ReadWriteOnce"
-                    ],
-                    hostPath: {
-                        enabled: false,
-                    }
-                }
+        },
+        persistence: {
+            models: {
+                size: "50Gi",
+                storageClass: "gp2",
+                accessModes: "ReadWriteOnce"
+            },
+            output: {
+                size: "10Gi",
+                storageClass: "gp2",
+                accessModes: "ReadWriteOnce"
+
             }
         }
     }
@@ -173,6 +214,7 @@ new k8s.helm.v3.Release("flowise", {
     provider: provider,
 });
 
+/*
 const iphoneIndex = new pinecone.PineconeIndex("iphone-index", {
     name: "iphone-index",
     metric: pinecone.IndexMetric.Cosine,
@@ -186,12 +228,5 @@ const iphoneIndex = new pinecone.PineconeIndex("iphone-index", {
             replicas: 1,
         }
     },
-});
-
-
-/*
-const locaAIRepository = new aws.ecr.Repository("local-ai-repository", {
-    name: "local-ai-demo",
-    forceDelete: true,
 });
 */
