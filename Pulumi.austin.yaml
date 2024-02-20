@@ -1,0 +1,7 @@
+config:
+  aws:region: eu-central-1
+  civo-navigate:desiredClusterSize: "3"
+  civo-navigate:eksNodeInstanceType: m4.4xlarge
+  civo-navigate:maxClusterSize: "6"
+  civo-navigate:minClusterSize: "3"
+  civo-navigate:vpcNetworkCidr: 10.0.0.0/16
